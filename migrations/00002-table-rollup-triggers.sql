@@ -32,27 +32,25 @@ DECLARE
 BEGIN
     FOREACH interval_name IN ARRAY intervals LOOP
         create_function_sql := format('
-            CREATE OR REPLACE FUNCTION update_%I_%s()
-            RETURNS TRIGGER AS $func$
+            CREATE OR REPLACE FUNCTION update_%I_%s(new_symbol TEXT, new_timestamp TIMESTAMP, new_open NUMERIC, new_high NUMERIC, new_low NUMERIC, new_close NUMERIC)
+            RETURNS VOID AS $func$
             DECLARE
                 interval_start TIMESTAMP;
             BEGIN
-                interval_start := date_trunc(''%s'', NEW.timestamp)' ||
+                interval_start := date_trunc(''%s'', new_timestamp)' ||
                 CASE 
-                    WHEN interval_name = '5min' THEN ' + interval ''5 min'' * (extract(minute from NEW.timestamp)::integer / 5);'
-                    WHEN interval_name = '15min' THEN ' + interval ''15 min'' * (extract(minute from NEW.timestamp)::integer / 15);'
+                    WHEN interval_name = '5min' THEN ' + interval ''5 min'' * (extract(minute from new_timestamp)::integer / 5);'
+                    WHEN interval_name = '15min' THEN ' + interval ''15 min'' * (extract(minute from new_timestamp)::integer / 15);'
                     WHEN interval_name = '1hour' THEN ';'
                     WHEN interval_name = '1day' THEN ';'
                 END || '
 
                 INSERT INTO %I_%s (symbol, timestamp, open_price, high_price, low_price, close_price)
-                VALUES (NEW.symbol, interval_start, NEW.open_price, NEW.high_price, NEW.low_price, NEW.close_price)
+                VALUES (new_symbol, interval_start, new_open, new_high, new_low, new_close)
                 ON CONFLICT (symbol, timestamp) DO UPDATE
-                SET high_price = GREATEST(%I_%s.high_price, NEW.high_price),
-                    low_price = LEAST(%I_%s.low_price, NEW.low_price),
-                    close_price = NEW.close_price;
-
-                RETURN NEW;
+                SET high_price = GREATEST(%I_%s.high_price, EXCLUDED.high_price),
+                    low_price = LEAST(%I_%s.low_price, EXCLUDED.low_price),
+                    close_price = EXCLUDED.close_price;
             END;
             $func$ LANGUAGE plpgsql;',
             asset_type, interval_name,
@@ -71,7 +69,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION create_all_intervals_update_function(asset_type TEXT)
 RETURNS VOID AS
-$outer$ -- outer level quote
+$outer$
 DECLARE
     create_function_sql TEXT;
 BEGIN
@@ -80,18 +78,15 @@ $string$
     CREATE OR REPLACE FUNCTION update_%I_all_intervals()
     RETURNS TRIGGER AS
     $func$ 
-    DECLARE
-        result BOOLEAN;
     BEGIN
-        EXECUTE format('SELECT update_%%I_5min()', TG_TABLE_NAME) INTO result;
-        EXECUTE format('SELECT update_%%I_15min()', TG_TABLE_NAME) INTO result;
-        EXECUTE format('SELECT update_%%I_1hour()', TG_TABLE_NAME) INTO result;
-        EXECUTE format('SELECT update_%%I_1day()', TG_TABLE_NAME) INTO result;
+        PERFORM update_%I_5min(NEW.symbol, NEW.timestamp, NEW.open_price, NEW.high_price, NEW.low_price, NEW.close_price);
+        PERFORM update_%I_15min(NEW.symbol, NEW.timestamp, NEW.open_price, NEW.high_price, NEW.low_price, NEW.close_price);
+        PERFORM update_%I_1hour(NEW.symbol, NEW.timestamp, NEW.open_price, NEW.high_price, NEW.low_price, NEW.close_price);
+        PERFORM update_%I_1day(NEW.symbol, NEW.timestamp, NEW.open_price, NEW.high_price, NEW.low_price, NEW.close_price);
         RETURN NEW;
     END;
     $func$ LANGUAGE plpgsql;
-$string$, asset_type);
-
+$string$, asset_type, asset_type, asset_type, asset_type, asset_type);
     EXECUTE create_function_sql;
 END;
 $outer$ LANGUAGE plpgsql;
@@ -205,7 +200,11 @@ RETURNS VOID AS $$
 DECLARE
     asset_type TEXT;
 BEGIN
-    asset_type := split_part(source_table_name, '_', 4);
+    asset_type := substring(source_table_name from 'minute_by_minute_(.*)');
+    
+    IF asset_type IS NULL THEN
+        RAISE EXCEPTION 'Invalid table name format. Expected "minute_by_minute_<asset_type>"';
+    END IF;
     
     PERFORM create_aggregated_tables(asset_type);
     PERFORM create_update_functions(asset_type);
